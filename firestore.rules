@@ -1,0 +1,150 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function staffPath() {
+      return /databases/$(database)/documents/staff/$(request.auth.uid);
+    }
+
+    function hasStaffProfile() {
+      return signedIn() && exists(staffPath());
+    }
+
+    function staffData() {
+      return get(staffPath()).data;
+    }
+
+    function supportedRole() {
+      return hasStaffProfile()
+        && staffData().role in [
+          'Manager', 'manager',
+          'Waiter', 'waiter',
+          'Receptionist', 'receptionist',
+          'Cook', 'cook'
+        ]
+        && (!('active' in staffData()) || staffData().active == true);
+    }
+
+    function isManager() {
+      return supportedRole() && staffData().role in ['Manager', 'manager'];
+    }
+
+    function isWaiter() {
+      return supportedRole() && staffData().role in ['Waiter', 'waiter'];
+    }
+
+    function isReceptionist() {
+      return supportedRole() && staffData().role in ['Receptionist', 'receptionist'];
+    }
+
+    function isCook() {
+      return supportedRole() && staffData().role in ['Cook', 'cook'];
+    }
+
+    function changedOnly(fields) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(fields);
+    }
+
+    function validNewOrder(orderId) {
+      let data = request.resource.data;
+      return data.keys().hasAll([
+          'id', 'displayId', 'table', 'items', 'subtotal', 'tax', 'total',
+          'requiresWaiter', 'createdBy', 'createdByUid', 'waiter',
+          'paymentMethod', 'status', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'displayId', 'table', 'items', 'subtotal', 'tax', 'total',
+          'requiresWaiter', 'createdBy', 'createdByUid', 'waiter',
+          'paymentMethod', 'status', 'createdAt'
+        ])
+        && data.id == orderId
+        && data.displayId is string
+        && data.displayId.size() == 6
+        && data.table is string
+        && data.table.size() > 0
+        && data.table.size() <= 80
+        && data.items is list
+        && data.items.size() > 0
+        && data.items.size() <= 100
+        && data.subtotal is number
+        && data.subtotal >= 0
+        && data.tax is number
+        && data.tax >= 0
+        && data.total is number
+        && data.total == data.subtotal + data.tax
+        && data.requiresWaiter is bool
+        && data.createdBy is string
+        && data.createdByUid == request.auth.uid
+        && data.waiter == null
+        && data.paymentMethod == null
+        && data.status == (data.requiresWaiter ? 'WAITING_FOR_WAITER' : 'WAITING_FOR_RECEPTIONIST')
+        && data.createdAt == request.time;
+    }
+
+    function validOrderUpdate() {
+      let oldStatus = resource.data.status;
+      let newStatus = request.resource.data.status;
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      return request.resource.data.updatedAt == request.time
+        && (
+          (isWaiter()
+            && oldStatus == 'WAITING_FOR_WAITER'
+            && newStatus == 'WAITING_FOR_RECEPTIONIST'
+            && request.resource.data.waiter is string
+            && changed.hasOnly(['status', 'waiter', 'updatedAt']))
+          ||
+          (isReceptionist()
+            && oldStatus == 'WAITING_FOR_RECEPTIONIST'
+            && newStatus == 'PAID_WAITING_FOR_COOK'
+            && request.resource.data.paymentMethod in ['Cash', 'Card', 'Digital Wallet']
+            && changed.hasOnly(['status', 'paymentMethod', 'updatedAt']))
+          ||
+          (isCook()
+            && oldStatus == 'PAID_WAITING_FOR_COOK'
+            && newStatus == 'PREPARING'
+            && changed.hasOnly(['status', 'updatedAt']))
+          ||
+          (isCook()
+            && oldStatus == 'PREPARING'
+            && newStatus == 'READY'
+            && changed.hasOnly(['status', 'updatedAt']))
+          ||
+          (isCook()
+            && oldStatus == 'READY'
+            && newStatus == 'COMPLETED'
+            && changed.hasOnly(['status', 'updatedAt']))
+          ||
+          (isManager()
+            && oldStatus in [
+              'WAITING_FOR_WAITER', 'WAITING_FOR_RECEPTIONIST',
+              'PAID_WAITING_FOR_COOK', 'PREPARING', 'READY'
+            ]
+            && newStatus == 'CANCELLED'
+            && changed.hasOnly(['status', 'updatedAt']))
+        );
+    }
+
+    match /staff/{staffId} {
+      // A user can read only their own staff profile. Staff profiles are managed
+      // in Firebase Console; clients cannot grant themselves roles.
+      allow get: if signedIn() && request.auth.uid == staffId;
+      allow list, create, update, delete: if false;
+    }
+
+    match /orders/{orderId} {
+      allow get, list: if supportedRole();
+      allow create: if isManager() && validNewOrder(orderId);
+      allow update: if supportedRole() && validOrderUpdate();
+      allow delete: if false;
+    }
+
+    // Deny access to all other collections by default.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

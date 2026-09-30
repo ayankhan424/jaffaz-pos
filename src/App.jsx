@@ -1,5 +1,18 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-
+import { onAuthStateChanged, signInWithEmailAndPassword, signOut } from "firebase/auth";
+import {
+  collection,
+  doc,
+  getDoc,
+  getDocs,
+  onSnapshot,
+  orderBy,
+  query,
+  serverTimestamp,
+  setDoc,
+  updateDoc,
+} from "firebase/firestore";
+import { auth, db } from "./firebase";
 import {
   LayoutDashboard,
   ShoppingCart,
@@ -881,6 +894,26 @@ const isPaymentPending = (order) =>
   order.status !== "WAITING_FOR_WAITER" &&
   order.status !== "CANCELLED";
 
+const KITCHEN_QUEUE_STATUSES = new Set([
+  "PAID_WAITING_FOR_COOK",
+  "PREPARING",
+  "READY",
+]);
+
+const normalizeOrder = (snapshot) => {
+  const data = snapshot.data();
+  const createdAt = data.createdAt?.toDate
+    ? data.createdAt.toDate().toISOString()
+    : data.createdAt || new Date().toISOString();
+
+  return {
+    ...data,
+    id: snapshot.id,
+    displayId: data.displayId || snapshot.id.slice(-6).toUpperCase(),
+    createdAt,
+  };
+};
+
 
 // ============================================================
 // MAIN APP
@@ -890,46 +923,73 @@ export default function App() {
 
   const [user, setUser] = useState(null);
 
-  const [username, setUsername] = useState("");
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loginError, setLoginError] = useState("");
+  const [activePage, setActivePage] = useState("dashboard");
 
   const [orders, setOrders] = useState([]);
   const [apiReady, setApiReady] = useState(false);
   const refreshOrders = useCallback(async () => {
-    const response = await fetch("/api/orders");
-    if (!response.ok) throw new Error("Unable to load orders");
-    setOrders(await response.json());
+    if (!auth.currentUser) throw new Error("Please sign in again.");
+    const result = await getDocs(query(collection(db, "orders"), orderBy("createdAt", "desc")));
+    setOrders(result.docs.map(normalizeOrder));
   }, []);
 
   useEffect(() => {
-    let active = true;
-    fetch("/api/session")
-      .then(async (response) => response.ok ? response.json() : null)
-      .then(async (session) => {
-        if (!active || !session?.user) return;
-        setUser(session.user);
-        await refreshOrders();
-      })
-      .catch(() => {})
-      .finally(() => { if (active) setApiReady(true); });
-    return () => { active = false; };
-  }, [refreshOrders]);
+    let current = true;
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (!current) return;
 
-  useEffect(() => {
-    if (!user) return undefined;
-    const syncOrders = () => {
-      if (document.visibilityState === "visible") refreshOrders().catch(() => {});
-    };
-    const timer = window.setInterval(syncOrders, 3000);
-    window.addEventListener("focus", syncOrders);
+      if (!firebaseUser) {
+        setUser(null);
+        setOrders([]);
+        setApiReady(true);
+        return;
+      }
+
+      try {
+        setApiReady(false);
+        const staffSnapshot = await getDoc(doc(db, "staff", firebaseUser.uid));
+        if (!staffSnapshot.exists()) {
+          throw new Error("Your account has no staff profile yet. Ask the manager to set it up.");
+        }
+        const staff = staffSnapshot.data();
+        const roles = {
+          manager: "Manager",
+          waiter: "Waiter",
+          receptionist: "Receptionist",
+          cook: "Cook",
+        };
+        const role = roles[String(staff.role || "").toLowerCase()];
+        if (!role || staff.active === false) {
+          throw new Error("Your staff account is disabled or has an invalid role.");
+        }
+        if (!current) return;
+        setUser({
+          uid: firebaseUser.uid,
+          email: firebaseUser.email,
+          username: staff.username || firebaseUser.email || firebaseUser.uid,
+          name: staff.name || firebaseUser.email || "Staff member",
+          role,
+        });
+        setActivePage("dashboard");
+        setLoginError("");
+      } catch (error) {
+        if (!current) return;
+        await signOut(auth);
+        setUser(null);
+        setLoginError(error.message || "Could not connect to the POS server.");
+      } finally {
+        if (current) setApiReady(true);
+      }
+    });
+
     return () => {
-      window.clearInterval(timer);
-      window.removeEventListener("focus", syncOrders);
+      current = false;
+      unsubscribe();
     };
-  }, [refreshOrders, user]);
-
-  const [activePage, setActivePage] = useState("dashboard");
+  }, []);
 
   const [cart, setCart] = useState([]);
   const [tableNumber, setTableNumber] = useState("");
@@ -952,35 +1012,36 @@ export default function App() {
     e.preventDefault();
 
     try {
-      const response = await fetch("/api/login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username, password }),
-      });
-      if (!response.ok) throw new Error("Incorrect username or password.");
-      const { user: signedInUser } = await response.json();
-      setUser(signedInUser);
-      await refreshOrders();
+      await signInWithEmailAndPassword(auth, email.trim(), password);
       setLoginError("");
-      setUsername("");
+      setEmail("");
       setPassword("");
       setActivePage("dashboard");
     } catch (error) {
-      setLoginError(error.message === "Failed to fetch" ? "POS server is unavailable. Start the app with npm run dev." : error.message);
+      const messages = {
+        "auth/invalid-credential": "Email or password is incorrect.",
+        "auth/invalid-email": "Enter a valid email address.",
+        "auth/too-many-requests": "Too many attempts. Wait a while, then try again.",
+      };
+      setLoginError(messages[error.code] || error.message || "Could not sign in.");
     }
-  }, [password, refreshOrders, username]);
+  }, [email, password, setActivePage]);
 
 
   // ==========================================================
   // LOGOUT
   // ==========================================================
 
-  const logout = useCallback(() => {
-    fetch("/api/logout", { method: "POST" }).catch(() => {});
-    setUser(null);
-    setCart([]);
-    setActivePage("dashboard");
-  }, []);
+  const logout = useCallback(async () => {
+    try {
+      await signOut(auth);
+      setCart([]);
+      setActivePage("dashboard");
+      setLoginError("");
+    } catch (error) {
+      setLoginError(error.message || "Could not log out. Please try again.");
+    }
+  }, [setActivePage]);
 
 
   // ==========================================================
@@ -1009,6 +1070,40 @@ export default function App() {
       notificationTimer.current = null;
     }, 3000);
   }, []);
+
+  useEffect(() => {
+    if (!user) return undefined;
+
+    const ordersQuery = query(collection(db, "orders"), orderBy("createdAt", "desc"));
+    return onSnapshot(
+      ordersQuery,
+      (snapshot) => setOrders(snapshot.docs.map(normalizeOrder)),
+      (error) => {
+        console.error("Live order updates failed:", error);
+        showNotification("Could not receive live order updates. Check your connection.");
+      }
+    );
+  }, [showNotification, user]);
+
+  const waiterQueueOrders = useMemo(
+    () => orders.filter((order) => order.status === "WAITING_FOR_WAITER"),
+    [orders]
+  );
+  const managerAttentionOrders = useMemo(
+    () => orders.filter((order) =>
+      order.status === "WAITING_FOR_WAITER" ||
+      (user?.role === "Manager" && order.status === "WAITING_FOR_RECEPTIONIST")
+    ),
+    [orders, user?.role]
+  );
+  const pendingPaymentOrders = useMemo(
+    () => orders.filter(isPaymentPending),
+    [orders]
+  );
+  const kitchenQueueOrders = useMemo(
+    () => orders.filter((order) => KITCHEN_QUEUE_STATUSES.has(order.status)),
+    [orders]
+  );
 
 
   // ==========================================================
@@ -1187,6 +1282,10 @@ export default function App() {
 
       requiresWaiter,
 
+      status: requiresWaiter
+        ? "WAITING_FOR_WAITER"
+        : "WAITING_FOR_RECEPTIONIST",
+
       createdBy: user.username,
 
       waiter: null,
@@ -1197,18 +1296,20 @@ export default function App() {
 
     };
 
-    let newOrder;
+    let orderId;
     try {
-      const response = await fetch("/api/orders", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(orderDraft),
+      const orderRef = doc(collection(db, "orders"));
+      orderId = orderRef.id;
+      await setDoc(orderRef, {
+        ...orderDraft,
+        id: orderRef.id,
+        displayId: orderRef.id.slice(-6).toUpperCase(),
+        createdByUid: user.uid,
+        createdAt: serverTimestamp(),
       });
-      if (!response.ok) throw new Error((await response.json()).error || "Could not create order");
-      newOrder = await response.json();
-      await refreshOrders();
     } catch (error) {
-      showNotification(error.message);
+      console.error("Create order failed:", error);
+      showNotification("Could not create the order. Check your connection and staff permissions.");
       return;
     }
 
@@ -1218,12 +1319,12 @@ export default function App() {
 
     showNotification(
       requiresWaiter
-        ? `Order #${newOrder.id} sent to the waiter`
-        : `Order #${newOrder.id} sent to the payment desk`
+        ? `Order #${orderId.slice(-6).toUpperCase()} sent to the waiter`
+        : `Order #${orderId.slice(-6).toUpperCase()} sent to the payment desk`
     );
 
     setActivePage("orders");
-  }, [cart, refreshOrders, requiresWaiter, showNotification, subtotal, tableNumber, tax, total, user]);
+  }, [cart, requiresWaiter, setActivePage, showNotification, subtotal, tableNumber, tax, total, user]);
 
 
   // ==========================================================
@@ -1232,20 +1333,24 @@ export default function App() {
 
   const updateOrder = useCallback(async (orderId, updates) => {
     try {
-      const response = await fetch(`/api/orders/${orderId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(updates),
-      });
-      if (!response.ok) throw new Error((await response.json()).error || "Could not update order");
-      const updatedOrder = await response.json();
-      setOrders((current) => current.map((order) => order.id === orderId ? updatedOrder : order));
-      return updatedOrder;
+      const firestoreUpdates = {
+        ...updates,
+        updatedAt: serverTimestamp(),
+      };
+      if (user?.role === "Waiter" && updates.status === "WAITING_FOR_RECEPTIONIST") {
+        firestoreUpdates.waiter = user.name;
+      }
+      if (user?.role === "Receptionist" && updates.paymentMethod) {
+        firestoreUpdates.status = "PAID_WAITING_FOR_COOK";
+      }
+      await updateDoc(doc(db, "orders", orderId), firestoreUpdates);
+      return true;
     } catch (error) {
-      showNotification(error.message);
+      console.error("Update order failed:", error);
+      showNotification("Could not update this order. It may have changed or your role may not allow this action.");
       return null;
     }
-  }, [showNotification]);
+  }, [showNotification, user]);
 
 
   // ==========================================================
@@ -1348,18 +1453,17 @@ export default function App() {
 
           <form onSubmit={login}>
 
-            <label>
-              Username
-            </label>
+            <label htmlFor="login-email">Email</label>
 
             <input
-              value={username}
-              onChange={(e) =>
-                setUsername(e.target.value)
-              }
-              placeholder="Enter username"
+              id="login-email"
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="Enter your email"
               autoComplete="username"
-              aria-label="Username"
+              aria-label="Email"
+              required
             />
 
 
@@ -1369,6 +1473,7 @@ export default function App() {
 
             <input
               type="password"
+              required
               value={password}
               onChange={(e) =>
                 setPassword(e.target.value)
@@ -1400,21 +1505,11 @@ export default function App() {
 
 
           <div className="demo-login">
-
             <div className="demo-title">
               <Sparkles size={15} />
-              Practice Accounts
+              Staff sign-in
             </div>
-
-            <div className="credentials-grid">
-
-              <span>Manager account</span>
-              <span>Waiter account</span>
-              <span>Receptionist account</span>
-              <span>Cook account</span>
-
-            </div>
-
+            <p>Use the email and password provided by your manager.</p>
           </div>
 
         </div>
@@ -1495,9 +1590,9 @@ export default function App() {
                 </span>
 
                 {item.id === "orders" &&
-                  orders.filter((o) => o.status === "WAITING_FOR_WAITER" || (user.role === "Manager" && o.status === "WAITING_FOR_RECEPTIONIST")).length > 0 && (
+                  managerAttentionOrders.length > 0 && (
                     <b className="nav-count">
-                      {orders.filter((o) => o.status === "WAITING_FOR_WAITER" || (user.role === "Manager" && o.status === "WAITING_FOR_RECEPTIONIST")).length}
+                      {managerAttentionOrders.length}
                     </b>
                   )}
 
@@ -1594,11 +1689,7 @@ export default function App() {
             >
               <Bell size={19} />
 
-              {orders.filter(
-                (o) =>
-                  o.status ===
-                  "WAITING_FOR_WAITER"
-              ).length > 0 && (
+              {waiterQueueOrders.length > 0 && (
                 <span></span>
               )}
 
@@ -1795,13 +1886,7 @@ export default function App() {
                 <RoleCard
                   icon={ClipboardList}
                   title="Orders Waiting"
-                  value={
-                    orders.filter(
-                      (o) =>
-                        o.status ===
-                        "WAITING_FOR_WAITER"
-                    ).length
-                  }
+                  value={waiterQueueOrders.length}
                   description="Orders need your confirmation"
                   button="Open Orders"
                   onClick={() =>
@@ -1823,9 +1908,7 @@ export default function App() {
                 <RoleCard
                   icon={CreditCard}
                   title="Pending Payments"
-                  value={
-                    orders.filter(isPaymentPending).length
-                  }
+                  value={pendingPaymentOrders.length}
                   description="Orders waiting for payment"
                   button="Open Payment Desk"
                   onClick={() =>
@@ -1847,9 +1930,7 @@ export default function App() {
                 <RoleCard
                   icon={ChefHat}
                   title="Kitchen Queue"
-                  value={
-                    orders.filter((o) => ["WAITING_FOR_RECEPTIONIST", "PAID_WAITING_FOR_COOK", "PREPARING", "READY"].includes(o.status)).length
-                  }
+                  value={kitchenQueueOrders.length}
                   description="Orders waiting in kitchen"
                   button="Open Kitchen"
                   onClick={() =>
@@ -2378,11 +2459,7 @@ export default function App() {
 
               <div className="orders-grid">
 
-                {orders
-                  .filter(
-                    isPaymentPending
-                  )
-                  .map((order) => (
+                {pendingPaymentOrders.map((order) => (
 
                     <PaymentCard
                       key={order.id}
@@ -2398,9 +2475,7 @@ export default function App() {
               </div>
 
 
-              {orders.filter(
-                isPaymentPending
-              ).length === 0 && (
+              {pendingPaymentOrders.length === 0 && (
 
                 <EmptyState
                   icon={CreditCard}
@@ -2443,11 +2518,7 @@ export default function App() {
 
               <div className="orders-grid">
 
-                {orders
-                  .filter(
-                    (order) => ["WAITING_FOR_RECEPTIONIST", "PAID_WAITING_FOR_COOK", "PREPARING", "READY"].includes(order.status)
-                  )
-                  .map((order) => (
+                {kitchenQueueOrders.map((order) => (
 
                     <KitchenCard
                       key={order.id}
@@ -2463,10 +2534,7 @@ export default function App() {
               </div>
 
 
-              {orders.filter(
-                (order) =>
-                  ["WAITING_FOR_RECEPTIONIST", "PAID_WAITING_FOR_COOK", "PREPARING", "READY"].includes(order.status)
-              ).length === 0 && (
+              {kitchenQueueOrders.length === 0 && (
 
                 <EmptyState
                   icon={ChefHat}
@@ -2708,7 +2776,7 @@ const OrderCard = memo(function OrderCard({
     });
     if (!updated) return;
     showNotification(
-      `Order #${order.id} confirmed`
+      `Order #${order.displayId || order.id} confirmed`
     );
   };
 
@@ -2719,7 +2787,7 @@ const OrderCard = memo(function OrderCard({
     });
     if (!updated) return;
     showNotification(
-      `Order #${order.id} cancelled`
+      `Order #${order.displayId || order.id} cancelled`
     );
   };
 
@@ -2733,7 +2801,7 @@ const OrderCard = memo(function OrderCard({
         <div>
 
           <span className="order-number">
-            ORDER #{order.id}
+            ORDER #{order.displayId || order.id}
           </span>
 
           <h3>
@@ -2863,7 +2931,7 @@ const PaymentCard = memo(function PaymentCard({
     });
     if (!updated) return;
     showNotification(
-      `Order #${order.id} paid by ${selectedPayment}`
+      `Order #${order.displayId || order.id} paid by ${selectedPayment}`
     );
 
   };
@@ -2878,7 +2946,7 @@ const PaymentCard = memo(function PaymentCard({
         <div>
 
           <span className="order-number">
-            ORDER #{order.id}
+            ORDER #{order.displayId || order.id}
           </span>
 
           <h3>
@@ -3002,7 +3070,7 @@ const KitchenCard = memo(function KitchenCard({
     });
     if (!updated) return;
     showNotification(
-      `Order #${order.id} is now preparing`
+      `Order #${order.displayId || order.id} is now preparing`
     );
 
   };
@@ -3014,7 +3082,7 @@ const KitchenCard = memo(function KitchenCard({
     });
     if (!updated) return;
     showNotification(
-      `Order #${order.id} is ready`
+      `Order #${order.displayId || order.id} is ready`
     );
 
   };
@@ -3026,7 +3094,7 @@ const KitchenCard = memo(function KitchenCard({
     });
     if (!updated) return;
     showNotification(
-      `Order #${order.id} completed`
+      `Order #${order.displayId || order.id} completed`
     );
 
   };
@@ -3041,7 +3109,7 @@ const KitchenCard = memo(function KitchenCard({
         <div>
 
           <span className="order-number">
-            KITCHEN #{order.id}
+            KITCHEN #{order.displayId || order.id}
           </span>
 
           <h3>
@@ -3107,7 +3175,7 @@ const KitchenCard = memo(function KitchenCard({
 
       <div className="order-actions">
 
-        {["WAITING_FOR_RECEPTIONIST", "PAID_WAITING_FOR_COOK"].includes(order.status) && (
+        {order.status === "PAID_WAITING_FOR_COOK" && (
 
           <button
             className="primary-button"

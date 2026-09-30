@@ -1,3 +1,5 @@
+// Legacy local JSON API. The current POS app uses Firebase Authentication and
+// Cloud Firestore directly; npm run dev no longer starts this server.
 import { createServer } from "node:http";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
