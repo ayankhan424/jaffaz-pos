@@ -45,6 +45,17 @@ service cloud.firestore {
       return supportedRole() && staffData().role in ['Cook', 'cook'];
     }
 
+    function canReadOrder() {
+      return isManager()
+        || (isWaiter()
+          && (resource.data.createdByUid == request.auth.uid
+            || resource.data.status == 'WAITING_FOR_WAITER'))
+        || (isReceptionist()
+          && resource.data.status == 'WAITING_FOR_RECEPTIONIST')
+        || (isCook()
+          && resource.data.status in ['PAID_WAITING_FOR_COOK', 'PREPARING', 'READY']);
+    }
+
     function changedOnly(fields) {
       return request.resource.data.diff(resource.data).affectedKeys().hasOnly(fields);
     }
@@ -53,12 +64,12 @@ service cloud.firestore {
       let data = request.resource.data;
       return data.keys().hasAll([
           'id', 'displayId', 'table', 'items', 'subtotal', 'tax', 'total',
-          'requiresWaiter', 'createdBy', 'createdByUid', 'waiter',
+          'requiresWaiter', 'costTotal', 'orderType', 'deliveryPhone', 'createdBy', 'createdByUid', 'waiter',
           'paymentMethod', 'status', 'createdAt'
         ])
         && data.keys().hasOnly([
           'id', 'displayId', 'table', 'items', 'subtotal', 'tax', 'total',
-          'requiresWaiter', 'createdBy', 'createdByUid', 'waiter',
+          'requiresWaiter', 'costTotal', 'orderType', 'deliveryPhone', 'createdBy', 'createdByUid', 'waiter',
           'paymentMethod', 'status', 'createdAt'
         ])
         && data.id == orderId
@@ -66,7 +77,7 @@ service cloud.firestore {
         && data.displayId.size() == 6
         && data.table is string
         && data.table.size() > 0
-        && data.table.size() <= 80
+        && data.table.size() <= 300
         && data.items is list
         && data.items.size() > 0
         && data.items.size() <= 100
@@ -77,6 +88,13 @@ service cloud.firestore {
         && data.total is number
         && data.total == data.subtotal + data.tax
         && data.requiresWaiter is bool
+        && (data.costTotal == null || (data.costTotal is number && data.costTotal >= 0))
+        && data.orderType in ['Dine In', 'Takeaway', 'Delivery']
+        && ((data.orderType == 'Delivery'
+            && data.deliveryPhone is string
+            && data.deliveryPhone.size() >= 7
+            && data.deliveryPhone.size() <= 25)
+          || (data.orderType != 'Delivery' && data.deliveryPhone == null))
         && data.createdBy is string
         && data.createdByUid == request.auth.uid
         && data.waiter == null
@@ -136,10 +154,45 @@ service cloud.firestore {
     }
 
     match /orders/{orderId} {
-      allow get, list: if supportedRole();
-      allow create: if isManager() && validNewOrder(orderId);
+      allow get, list: if canReadOrder();
+      // Manager, waiter, and receptionist can enter orders. All new staff-created
+      // orders still pass the same field and status checks above.
+      allow create: if (isWaiter() || isReceptionist()) && validNewOrder(orderId);
       allow update: if supportedRole() && validOrderUpdate();
       allow delete: if false;
+    }
+
+    match /inventory/{itemId} {
+      allow get, list: if isManager();
+      allow create: if isManager()
+        && request.resource.data.keys().hasOnly(['name', 'quantity', 'unit', 'minimum', 'createdAt', 'updatedAt'])
+        && request.resource.data.keys().hasAll(['name', 'quantity', 'unit', 'minimum', 'createdAt', 'updatedAt'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.quantity is number
+        && request.resource.data.quantity >= 0
+        && request.resource.data.unit is string
+        && request.resource.data.minimum is number
+        && request.resource.data.minimum >= 0;
+      allow update: if isManager()
+        && changedOnly(['name', 'quantity', 'unit', 'minimum', 'updatedAt'])
+        && request.resource.data.quantity is number
+        && request.resource.data.quantity >= 0
+        && request.resource.data.minimum is number
+        && request.resource.data.minimum >= 0;
+      allow delete: if isManager();
+    }
+
+    match /menuCosts/{costId} {
+      // Staff clients need to snapshot the configured cost when they create an order.
+      // Only a manager can change the cost records.
+      allow get, list: if supportedRole();
+      allow create, update: if isManager()
+        && request.resource.data.keys().hasOnly(['unitCost', 'updatedAt'])
+        && request.resource.data.keys().hasAll(['unitCost', 'updatedAt'])
+        && request.resource.data.unitCost is number
+        && request.resource.data.unitCost >= 0;
+      allow delete: if isManager();
     }
 
     // Deny access to all other collections by default.

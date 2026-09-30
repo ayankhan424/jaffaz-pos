@@ -2,15 +2,19 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { onAuthStateChanged, signInWithEmailAndPassword, signOut } from "firebase/auth";
 import {
   collection,
+  deleteDoc,
   doc,
   getDoc,
   getDocs,
   onSnapshot,
   orderBy,
+  or,
   query,
   serverTimestamp,
   setDoc,
+  addDoc,
   updateDoc,
+  where,
 } from "firebase/firestore";
 import { auth, db } from "./firebase";
 import {
@@ -44,6 +48,13 @@ import {
   CircleDollarSign,
   PackageCheck,
   CookingPot,
+  Boxes,
+  TrendingUp,
+  Truck,
+  UtensilsCrossed,
+  Save,
+  MapPin,
+  PhoneCall,
 } from "lucide-react";
 
 
@@ -68,14 +79,16 @@ const TAX_RATE = 0.05;
 
 const ROLE_NAVIGATION = {
   Manager: [
-    { id: "create-order", label: "Create Order", icon: ShoppingCart },
     { id: "orders", label: "All Orders", icon: ClipboardList },
+    { id: "inventory", label: "Stock & Costs", icon: Boxes },
     { id: "menu", label: "Menu", icon: Utensils },
   ],
   Waiter: [
+    { id: "create-order", label: "Create Order", icon: ShoppingCart },
     { id: "orders", label: "Orders", icon: ClipboardList },
   ],
   Receptionist: [
+    { id: "create-order", label: "Create Order", icon: ShoppingCart },
     { id: "payments", label: "Payments", icon: CreditCard },
   ],
   Cook: [
@@ -852,6 +865,9 @@ const formatPrice = (price) => {
   return `Rs. ${Number(price).toLocaleString()}`;
 };
 
+const isDeliveryOrder = (order) => order.orderType === "Delivery" || String(order.table || "").startsWith("Delivery ·");
+const deliveryAddress = (order) => String(order.table || "").replace(/^Delivery\s*·\s*/, "");
+
 const statusInfo = {
   WAITING_FOR_WAITER: {
     label: "Waiting for Waiter",
@@ -914,6 +930,24 @@ const normalizeOrder = (snapshot) => {
   };
 };
 
+const ordersQueryForUser = (staffUser) => {
+  const ordersCollection = collection(db, "orders");
+  if (staffUser.role === "Manager") return query(ordersCollection, orderBy("createdAt", "desc"));
+  if (staffUser.role === "Waiter") {
+    return query(ordersCollection, or(
+      where("createdByUid", "==", staffUser.uid),
+      where("status", "==", "WAITING_FOR_WAITER")
+    ));
+  }
+  if (staffUser.role === "Receptionist") return query(ordersCollection, where("status", "==", "WAITING_FOR_RECEPTIONIST"));
+  if (staffUser.role === "Cook") return query(ordersCollection, where("status", "in", [...KITCHEN_QUEUE_STATUSES]));
+  return query(ordersCollection, where("createdByUid", "==", staffUser.uid));
+};
+
+const normalizeOrders = (snapshots) => snapshots.docs
+  .map(normalizeOrder)
+  .sort((first, second) => new Date(second.createdAt) - new Date(first.createdAt));
+
 
 // ============================================================
 // MAIN APP
@@ -929,12 +963,19 @@ export default function App() {
   const [activePage, setActivePage] = useState("dashboard");
 
   const [orders, setOrders] = useState([]);
+  const [stockItems, setStockItems] = useState([]);
+  const [menuCosts, setMenuCosts] = useState({});
+  const [receiptOrder, setReceiptOrder] = useState(null);
+  const [orderType, setOrderType] = useState("Takeaway");
+  const [deliveryPhone, setDeliveryPhone] = useState("");
+  const [stockDraft, setStockDraft] = useState({ name: "", quantity: "", unit: "pieces", minimum: "" });
+  const [costDrafts, setCostDrafts] = useState({});
   const [apiReady, setApiReady] = useState(false);
   const refreshOrders = useCallback(async () => {
     if (!auth.currentUser) throw new Error("Please sign in again.");
-    const result = await getDocs(query(collection(db, "orders"), orderBy("createdAt", "desc")));
-    setOrders(result.docs.map(normalizeOrder));
-  }, []);
+    const result = await getDocs(ordersQueryForUser(user));
+    setOrders(normalizeOrders(result));
+  }, [user]);
 
   useEffect(() => {
     let current = true;
@@ -1074,15 +1115,36 @@ export default function App() {
   useEffect(() => {
     if (!user) return undefined;
 
-    const ordersQuery = query(collection(db, "orders"), orderBy("createdAt", "desc"));
+    const ordersQuery = ordersQueryForUser(user);
     return onSnapshot(
       ordersQuery,
-      (snapshot) => setOrders(snapshot.docs.map(normalizeOrder)),
+      (snapshot) => setOrders(normalizeOrders(snapshot)),
       (error) => {
         console.error("Live order updates failed:", error);
         showNotification("Could not receive live order updates. Check your connection.");
       }
     );
+  }, [showNotification, user]);
+
+  useEffect(() => {
+    if (!user) return undefined;
+    let stopStock = () => {};
+    if (user.role === "Manager") {
+      stopStock = onSnapshot(collection(db, "inventory"), (snapshot) => {
+        setStockItems(snapshot.docs.map((entry) => ({ id: entry.id, ...entry.data() }))
+          .sort((first, second) => first.name.localeCompare(second.name)));
+      }, (error) => {
+        console.error("Inventory updates failed:", error);
+        showNotification("Could not load stock. Check the latest Firestore rules.");
+      });
+    }
+    const stopCosts = onSnapshot(collection(db, "menuCosts"), (snapshot) => {
+      setMenuCosts(Object.fromEntries(snapshot.docs.map((entry) => [entry.id, entry.data().unitCost])));
+    }, (error) => {
+      console.error("Menu cost updates failed:", error);
+      showNotification("Could not load item costs. Check the latest Firestore rules.");
+    });
+    return () => { stopStock(); stopCosts(); };
   }, [showNotification, user]);
 
   const waiterQueueOrders = useMemo(
@@ -1104,6 +1166,15 @@ export default function App() {
     () => orders.filter((order) => KITCHEN_QUEUE_STATUSES.has(order.status)),
     [orders]
   );
+  const currentRole = user?.role;
+  const currentUid = user?.uid;
+  const visibleOrders = useMemo(() => {
+    if (currentRole === "Manager") return orders;
+    if (currentRole === "Waiter") {
+      return orders.filter((order) => order.createdByUid === currentUid || order.status === "WAITING_FOR_WAITER");
+    }
+    return [];
+  }, [orders, currentRole, currentUid]);
 
 
   // ==========================================================
@@ -1139,7 +1210,9 @@ export default function App() {
       return;
     }
 
-    const price = variant
+    const price = item.customPrice
+      ? item.price
+      : variant
       ? item.variants[variant]
       : item.price;
 
@@ -1193,7 +1266,7 @@ export default function App() {
       showNotification("Enter a price greater than zero.");
       return;
     }
-    addToCart({ ...selectedProduct, special: false, price }, "Special");
+    addToCart({ ...selectedProduct, special: false, customPrice: true, price }, "Special");
   }, [addToCart, customPrice, selectedProduct, showNotification]);
 
 
@@ -1266,11 +1339,25 @@ export default function App() {
       showNotification("Please add items first.");
       return;
     }
+    if ((orderType === "Dine In" || orderType === "Delivery") && !tableNumber.trim()) {
+      showNotification(orderType === "Dine In" ? "Enter the table number." : "Enter the delivery address.");
+      return;
+    }
+    const phoneDigits = deliveryPhone.replace(/\D/g, "");
+    if (orderType === "Delivery" && (phoneDigits.length < 7 || phoneDigits.length > 15)) {
+      showNotification("Enter a valid delivery phone number (7–15 digits).");
+      return;
+    }
 
     const orderDraft = {
-      table:
-        tableNumber.trim() ||
-        "Takeaway",
+      table: orderType === "Dine In"
+        ? `Dine In · ${tableNumber.trim()}`
+        : orderType === "Delivery"
+          ? `Delivery · ${tableNumber.trim()}`
+          : "Takeaway",
+
+      orderType,
+      deliveryPhone: orderType === "Delivery" ? deliveryPhone.trim() : null,
 
       items: cart,
 
@@ -1280,9 +1367,13 @@ export default function App() {
 
       total,
 
-      requiresWaiter,
+      costTotal: cart.every((item) => menuCosts[`${item.id}__${item.variant || "default"}`] !== undefined)
+        ? cart.reduce((sum, item) => sum + Number(menuCosts[`${item.id}__${item.variant || "default"}`]) * item.quantity, 0)
+        : null,
 
-      status: requiresWaiter
+      requiresWaiter: user.role === "Manager" && requiresWaiter,
+
+      status: user.role === "Manager" && requiresWaiter
         ? "WAITING_FOR_WAITER"
         : "WAITING_FOR_RECEPTIONIST",
 
@@ -1309,22 +1400,26 @@ export default function App() {
       });
     } catch (error) {
       console.error("Create order failed:", error);
-      showNotification("Could not create the order. Check your connection and staff permissions.");
+      showNotification(error?.code === "permission-denied"
+        ? "Firebase blocked this order. Publish the latest Firestore rules, then try again."
+        : `Could not create the order${error?.message ? `: ${error.message}` : ". Check your connection and staff permissions."}`);
       return;
     }
 
     setCart([]);
     setTableNumber("");
+    setDeliveryPhone("");
+    setOrderType("Takeaway");
     setRequiresWaiter(false);
 
     showNotification(
-      requiresWaiter
+      user.role === "Manager" && requiresWaiter
         ? `Order #${orderId.slice(-6).toUpperCase()} sent to the waiter`
         : `Order #${orderId.slice(-6).toUpperCase()} sent to the payment desk`
     );
 
-    setActivePage("orders");
-  }, [cart, requiresWaiter, setActivePage, showNotification, subtotal, tableNumber, tax, total, user]);
+    setActivePage(user.role === "Receptionist" ? "payments" : "orders");
+  }, [cart, deliveryPhone, menuCosts, orderType, requiresWaiter, setActivePage, showNotification, subtotal, tableNumber, tax, total, user]);
 
 
   // ==========================================================
@@ -1352,6 +1447,66 @@ export default function App() {
     }
   }, [showNotification, user]);
 
+  const addStockItem = useCallback(async (event) => {
+    event.preventDefault();
+    const quantity = Number(stockDraft.quantity);
+    const minimum = Number(stockDraft.minimum || 0);
+    if (!stockDraft.name.trim() || !Number.isFinite(quantity) || quantity < 0 || !Number.isFinite(minimum) || minimum < 0) {
+      showNotification("Enter a stock name and valid quantities.");
+      return;
+    }
+    try {
+      await addDoc(collection(db, "inventory"), {
+        name: stockDraft.name.trim(), quantity, unit: stockDraft.unit.trim() || "pieces", minimum,
+        createdAt: serverTimestamp(), updatedAt: serverTimestamp(),
+      });
+      setStockDraft({ name: "", quantity: "", unit: "pieces", minimum: "" });
+      showNotification("Stock item added.");
+    } catch (error) {
+      console.error("Add stock item failed:", error);
+      showNotification("Could not add stock. Check manager permissions and Firestore rules.");
+    }
+  }, [showNotification, stockDraft]);
+
+  const changeStockQuantity = useCallback(async (stockItem, amount) => {
+    const quantity = Math.max(0, Number(stockItem.quantity || 0) + amount);
+    try {
+      await updateDoc(doc(db, "inventory", stockItem.id), { quantity, updatedAt: serverTimestamp() });
+    } catch (error) {
+      console.error("Stock quantity update failed:", error);
+      showNotification("Could not update stock quantity.");
+    }
+  }, [showNotification]);
+
+  const removeStockItem = useCallback(async (stockItem) => {
+    try {
+      await deleteDoc(doc(db, "inventory", stockItem.id));
+      showNotification(`${stockItem.name} removed from stock.`);
+    } catch (error) {
+      console.error("Remove stock item failed:", error);
+      showNotification("Could not remove this stock item.");
+    }
+  }, [showNotification]);
+
+  const saveMenuCost = useCallback(async (costId) => {
+    if (String(costDrafts[costId] ?? "").trim() === "") {
+      showNotification("Enter the cost before saving it.");
+      return;
+    }
+    const unitCost = Number(costDrafts[costId]);
+    if (!Number.isFinite(unitCost) || unitCost < 0) {
+      showNotification("Enter a valid cost (zero or more).");
+      return;
+    }
+    try {
+      await setDoc(doc(db, "menuCosts", costId), { unitCost, updatedAt: serverTimestamp() });
+      showNotification("Item cost saved.");
+    } catch (error) {
+      console.error("Save menu cost failed:", error);
+      showNotification("Could not save the item cost. Check Firestore rules.");
+    }
+  }, [costDrafts, showNotification]);
+
 
   // ==========================================================
   // MANAGER
@@ -1361,30 +1516,56 @@ export default function App() {
     let waiting = 0;
     let kitchen = 0;
     let sales = 0;
+    let grossProfit = 0;
+    let hasAllCosts = true;
+    let hasEstimatedOrders = false;
+    const now = new Date();
 
     for (const order of orders) {
-      if (order.status === "WAITING_FOR_WAITER" || order.status === "WAITING_FOR_RECEPTIONIST") waiting += 1;
+      const created = new Date(order.createdAt);
+      const isToday = created.getFullYear() === now.getFullYear()
+        && created.getMonth() === now.getMonth()
+        && created.getDate() === now.getDate();
+      if (isToday && (order.status === "WAITING_FOR_WAITER" || order.status === "WAITING_FOR_RECEPTIONIST")) waiting += 1;
 
       if (
+        isToday && (
         order.status === "PAID_WAITING_FOR_COOK" ||
         order.status === "PREPARING" ||
-        order.status === "READY"
+        order.status === "READY")
       ) {
         kitchen += 1;
       }
 
-      if (order.status !== "CANCELLED") {
-        sales += order.total;
+      if (isToday && order.paymentMethod && order.status !== "CANCELLED") {
+        sales += Number(order.total || 0);
+        if (typeof order.costTotal === "number") {
+          grossProfit += Number(order.subtotal || 0) - order.costTotal;
+        } else {
+          hasEstimatedOrders = true;
+          let legacyCost = 0;
+          for (const item of order.items || []) {
+            const unitCost = menuCosts[`${item.id}__${item.variant || "default"}`];
+            if (unitCost === undefined) hasAllCosts = false;
+            else legacyCost += Number(unitCost) * Number(item.quantity || 0);
+          }
+          grossProfit += Number(order.subtotal || 0) - legacyCost;
+        }
       }
     }
 
     return {
-      totalOrders: orders.length,
+      totalOrders: orders.filter((order) => {
+        const created = new Date(order.createdAt);
+        return created.getFullYear() === now.getFullYear() && created.getMonth() === now.getMonth() && created.getDate() === now.getDate();
+      }).length,
       waiting,
       kitchen,
       sales,
+      grossProfit: hasAllCosts ? Math.round(grossProfit) : null,
+      hasEstimatedOrders,
     };
-  }, [orders]);
+  }, [menuCosts, orders]);
 
 
   // ==========================================================
@@ -1662,6 +1843,8 @@ export default function App() {
                 ? "Kitchen Display"
                 : activePage === "menu"
                 ? "Restaurant Menu"
+                : activePage === "inventory"
+                ? "Stock & Costs"
                 : "Dashboard"}
             </h1>
 
@@ -1695,18 +1878,6 @@ export default function App() {
 
             </button>
 
-            <button
-              type="button"
-              className="signout-button"
-              onClick={logout}
-              aria-label="Sign out"
-              title="Sign out"
-            >
-              <LogOut size={17} />
-              <span>Sign out</span>
-            </button>
-
-
             <div className="topbar-user">
 
               <div className="user-avatar small">
@@ -1724,6 +1895,17 @@ export default function App() {
               </div>
 
             </div>
+
+            <button
+              type="button"
+              className="signout-button"
+              onClick={logout}
+              aria-label="Sign out"
+              title="Sign out"
+            >
+              <LogOut size={17} />
+              <span>Log out</span>
+            </button>
 
           </div>
 
@@ -1810,42 +1992,22 @@ export default function App() {
 
                   <StatCard
                     icon={CircleDollarSign}
-                    title="Sales"
+                    title="Today's Sales"
                     value={formatPrice(managerStats.sales)}
-                    description="Current total"
+                    description="Paid orders today"
+                  />
+
+                  <StatCard
+                    icon={TrendingUp}
+                    title="Today's Gross Profit"
+                    value={managerStats.grossProfit === null ? "Set item costs" : formatPrice(managerStats.grossProfit)}
+                    description={managerStats.grossProfit === null ? "Add costs under Stock & Costs" : managerStats.hasEstimatedOrders ? "Older orders use current cost estimates" : "Calculated from costs saved with orders"}
                   />
 
                 </div>
 
 
                 <div className="quick-actions">
-
-                  <button
-                    onClick={() =>
-                      setActivePage("create-order")
-                    }
-                    className="quick-action primary"
-                  >
-
-                    <div className="quick-icon">
-                      <Plus size={23} />
-                    </div>
-
-                    <div>
-                      <strong>
-                        Create New Order
-                      </strong>
-
-                      <span>
-                        Start a customer order
-                      </span>
-                    </div>
-
-                    <ArrowRight size={20} />
-
-                  </button>
-
-
                   <button
                     onClick={() =>
                       setActivePage("orders")
@@ -1871,6 +2033,15 @@ export default function App() {
 
                   </button>
 
+                  <button
+                    onClick={() => setActivePage("inventory")}
+                    className="quick-action"
+                  >
+                    <div className="quick-icon"><Boxes size={23} /></div>
+                    <div><strong>Stock & Costs</strong><span>Update stock levels and item costs</span></div>
+                    <ArrowRight size={20} />
+                  </button>
+
                 </div>
 
               </>
@@ -1887,10 +2058,10 @@ export default function App() {
                   icon={ClipboardList}
                   title="Orders Waiting"
                   value={waiterQueueOrders.length}
-                  description="Orders need your confirmation"
-                  button="Open Orders"
+                  description="Confirm manager orders or create an order to send to reception"
+                  button="Create Order"
                   onClick={() =>
-                    setActivePage("orders")
+                    setActivePage("create-order")
                   }
                 />
 
@@ -1911,9 +2082,16 @@ export default function App() {
                   value={pendingPaymentOrders.length}
                   description="Orders waiting for payment"
                   button="Open Payment Desk"
-                  onClick={() =>
-                    setActivePage("payments")
-                  }
+                  onClick={() => setActivePage("payments")}
+                />
+
+                <RoleCard
+                  icon={ShoppingCart}
+                  title="New Customer Order"
+                  value="Create"
+                  description="Send a new order directly to the payment desk."
+                  button="Create Order"
+                  onClick={() => setActivePage("create-order")}
                 />
 
               </div>
@@ -1952,7 +2130,7 @@ export default function App() {
         ==================================================== */}
 
         {activePage === "create-order" &&
-          user.role === "Manager" && (
+          ["Waiter", "Receptionist"].includes(user.role) && (
 
             <div className="page-content order-page">
 
@@ -2177,35 +2355,44 @@ export default function App() {
                   </div>
 
 
-                  <div className="table-input">
-
-                    <label>
-                      Table / Order Type
-                    </label>
-
-                    <input
-                      value={tableNumber}
-                      onChange={(e) =>
-                        setTableNumber(
-                          e.target.value
-                        )
-                      }
-                      placeholder="e.g. Table 5 / Takeaway"
-                    />
-
+                  <div className="order-type-section">
+                    <label>Order type</label>
+                    <div className="order-type-picker">
+                      {[
+                        { label: "Dine In", icon: UtensilsCrossed },
+                        { label: "Takeaway", icon: ShoppingCart },
+                        { label: "Delivery", icon: Truck },
+                      ].map(({ label, icon: TypeIcon }) => (
+                        <button key={label} type="button" className={orderType === label ? "order-type-button selected" : "order-type-button"} onClick={() => { setOrderType(label); setTableNumber(""); setDeliveryPhone(""); }}>
+                          <TypeIcon size={17} />{label}
+                        </button>
+                      ))}
+                    </div>
                   </div>
 
-                  <label className="handoff-option">
-                    <input
-                      type="checkbox"
-                      checked={requiresWaiter}
-                      onChange={(event) => setRequiresWaiter(event.target.checked)}
-                    />
-                    <span>
-                      <strong>Waiter confirmation required</strong>
-                      <small>Leave off to send this order straight to the payment desk.</small>
-                    </span>
-                  </label>
+                  {orderType !== "Takeaway" && (
+                    <div className="table-input order-detail-input">
+                      <label>{orderType === "Dine In" ? "Table number" : "Delivery address"}</label>
+                      <input maxLength={300} value={tableNumber} onChange={(event) => setTableNumber(event.target.value)} placeholder={orderType === "Dine In" ? "e.g. Table 5" : "Enter the customer's delivery address"} />
+                    </div>
+                  )}
+
+                  {orderType === "Delivery" && (
+                    <div className="table-input order-detail-input delivery-phone-input">
+                      <label htmlFor="delivery-phone">Customer phone number</label>
+                      <input id="delivery-phone" type="tel" inputMode="tel" autoComplete="tel" maxLength={25} value={deliveryPhone} onChange={(event) => setDeliveryPhone(event.target.value)} placeholder="e.g. +92 300 1234567" required />
+                    </div>
+                  )}
+
+                  {user.role === "Manager" && (
+                    <label className="handoff-option">
+                      <input type="checkbox" checked={requiresWaiter} onChange={(event) => setRequiresWaiter(event.target.checked)} />
+                      <span>
+                        <strong>Waiter confirmation required</strong>
+                        <small>When enabled, the order waits for a waiter before reception.</small>
+                      </span>
+                    </label>
+                  )}
 
 
                   <div className="cart-items">
@@ -2396,19 +2583,19 @@ export default function App() {
             </div>
 
 
-            {orders.length === 0 ? (
+            {visibleOrders.length === 0 ? (
 
               <EmptyState
                 icon={ClipboardList}
                 title="No orders yet"
-                description="Orders created by the manager will appear here."
+                description={user.role === "Waiter" ? "Your active orders and orders waiting for waiter confirmation will appear here." : "Orders created by staff will appear here."}
               />
 
             ) : (
 
               <div className="orders-grid">
 
-                {orders.map((order) => (
+                {visibleOrders.map((order) => (
 
                   <OrderCard
                     key={order.id}
@@ -2465,6 +2652,7 @@ export default function App() {
                       key={order.id}
                       order={order}
                       updateOrder={updateOrder}
+                      onReceipt={setReceiptOrder}
                       showNotification={
                         showNotification
                       }
@@ -2547,6 +2735,64 @@ export default function App() {
             </div>
 
           )}
+
+        {activePage === "inventory" && user.role === "Manager" && (
+          <div className="page-content inventory-page">
+            <section className="inventory-panel">
+              <div className="section-heading">
+                <div><span className="eyebrow">MANAGER ONLY</span><h2>Stock list</h2></div>
+                <span className="inventory-count">{stockItems.length} tracked items</span>
+              </div>
+              <form className="stock-add-form" onSubmit={addStockItem}>
+                <input aria-label="Stock item name" placeholder="Item name (e.g. mozzarella)" value={stockDraft.name} onChange={(event) => setStockDraft((draft) => ({ ...draft, name: event.target.value }))} required />
+                <input aria-label="Stock quantity" type="number" min="0" step="0.1" placeholder="Quantity" value={stockDraft.quantity} onChange={(event) => setStockDraft((draft) => ({ ...draft, quantity: event.target.value }))} required />
+                <input aria-label="Stock unit" placeholder="Unit (kg, bottles...)" value={stockDraft.unit} onChange={(event) => setStockDraft((draft) => ({ ...draft, unit: event.target.value }))} required />
+                <input aria-label="Low stock threshold" type="number" min="0" step="0.1" placeholder="Alert below" value={stockDraft.minimum} onChange={(event) => setStockDraft((draft) => ({ ...draft, minimum: event.target.value }))} />
+                <button className="primary-button" type="submit"><Plus size={17} /> Add stock</button>
+              </form>
+              {stockItems.length === 0 ? (
+                <EmptyState icon={Boxes} title="No stock items yet" description="Add your ingredients or supplies above. Stock values are shared through Firebase with the manager account." />
+              ) : (
+                <div className="stock-list">
+                  {stockItems.map((item) => {
+                    const low = Number(item.quantity) <= Number(item.minimum || 0);
+                    return (
+                      <div className="stock-row" key={item.id}>
+                        <div className="stock-item-icon"><Boxes size={19} /></div>
+                        <div className="stock-item-name"><strong>{item.name}</strong><small>{low ? "Low stock" : `Alert at ${item.minimum || 0} ${item.unit}`}</small></div>
+                        <div className={low ? "stock-quantity low" : "stock-quantity"}>{item.quantity} <small>{item.unit}</small></div>
+                        <div className="stock-controls">
+                          <button type="button" aria-label={`Decrease ${item.name}`} onClick={() => changeStockQuantity(item, -1)}><Minus size={15} /></button>
+                          <button type="button" aria-label={`Increase ${item.name}`} onClick={() => changeStockQuantity(item, 1)}><Plus size={15} /></button>
+                          <button type="button" className="stock-delete" aria-label={`Remove ${item.name}`} onClick={() => removeStockItem(item)}><Trash2 size={15} /></button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+
+            <section className="inventory-panel cost-panel">
+              <div className="section-heading">
+                <div><span className="eyebrow">GROSS PROFIT SETUP</span><h2>Cost per menu item</h2></div>
+              </div>
+              <p className="inventory-help">Enter your ingredient cost for one serving. Profit is calculated from paid sales minus these costs. Leave unknown costs blank; profit stays unavailable until every sold item has a cost.</p>
+              <div className="cost-list">
+                {menuItems.flatMap((item) => item.variants
+                  ? Object.keys(item.variants).map((variant) => ({ id: `${item.id}__${variant}`, label: `${item.name} · ${variant}` }))
+                  : [{ id: `${item.id}__default`, label: item.name }]
+                ).map((entry) => (
+                  <div className="cost-row" key={entry.id}>
+                    <span>{entry.label}</span>
+                    <label><span className="sr-only">Cost per serving for {entry.label}</span><input type="number" min="0" step="1" placeholder="Not set" value={costDrafts[entry.id] ?? (menuCosts[entry.id] ?? "")} onChange={(event) => setCostDrafts((draft) => ({ ...draft, [entry.id]: event.target.value }))} /></label>
+                    <button type="button" className="secondary-button cost-save" onClick={() => saveMenuCost(entry.id)}><Save size={15} /> Save</button>
+                  </div>
+                ))}
+              </div>
+            </section>
+          </div>
+        )}
 
 
         {/* ====================================================
@@ -2643,6 +2889,19 @@ export default function App() {
                 <button type="submit" className="primary-button">Add to order</button>
               </div>
             </form>
+          </div>
+        )}
+
+        {receiptOrder && (
+          <div className="modal-backdrop receipt-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) setReceiptOrder(null); }}>
+            <div className="receipt-print-area">
+              <div className="receipt-brand"><div className="receipt-logo">JZ</div><div><strong>JAFFA'Z FOOD LOUNGE</strong><small>Customer receipt</small></div></div>
+              <div className="receipt-meta"><span>Order <strong>#{receiptOrder.displayId || receiptOrder.id}</strong></span><span>{receiptOrder.table}</span><span>{new Date(receiptOrder.createdAt).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}</span></div>
+              <div className="receipt-items">{receiptOrder.items.map((item) => <div key={item.cartId}><span>{item.quantity} × {item.name}{item.variant ? ` (${item.variant})` : ""}</span><strong>{formatPrice(item.price * item.quantity)}</strong></div>)}</div>
+              <div className="receipt-totals"><div><span>Subtotal</span><strong>{formatPrice(receiptOrder.subtotal)}</strong></div><div><span>Tax</span><strong>{formatPrice(receiptOrder.tax)}</strong></div><div className="receipt-grand-total"><span>Total paid</span><strong>{formatPrice(receiptOrder.total)}</strong></div></div>
+              <div className="receipt-thanks">Paid by {receiptOrder.paymentMethod || "—"}<br />Thank you for visiting Jaffa'z!</div>
+              <div className="receipt-actions"><button type="button" className="secondary-button" onClick={() => setReceiptOrder(null)}>Close</button><button type="button" className="primary-button" onClick={() => window.print()}><Receipt size={17} /> Print receipt</button></div>
+            </div>
           </div>
         )}
 
@@ -2801,6 +3060,7 @@ const OrderCard = memo(function OrderCard({
         <div>
 
           <span className="order-number">
+            <Sparkles size={14} />
             ORDER #{order.displayId || order.id}
           </span>
 
@@ -2918,6 +3178,7 @@ const OrderCard = memo(function OrderCard({
 const PaymentCard = memo(function PaymentCard({
   order,
   updateOrder,
+  onReceipt,
   showNotification,
 }) {
 
@@ -2933,6 +3194,7 @@ const PaymentCard = memo(function PaymentCard({
     showNotification(
       `Order #${order.displayId || order.id} paid by ${selectedPayment}`
     );
+    onReceipt({ ...order, paymentMethod: selectedPayment });
 
   };
 
@@ -2946,11 +3208,12 @@ const PaymentCard = memo(function PaymentCard({
         <div>
 
           <span className="order-number">
+            <Sparkles size={14} />
             ORDER #{order.displayId || order.id}
           </span>
 
           <h3>
-            {order.table}
+            {isDeliveryOrder(order) ? "Delivery order" : order.table}
           </h3>
 
         </div>
@@ -2961,6 +3224,15 @@ const PaymentCard = memo(function PaymentCard({
         </span>
 
       </div>
+
+      {isDeliveryOrder(order) && (
+        <div className="delivery-contact">
+          <div><MapPin size={16} /><span><small>Delivery address</small><strong>{deliveryAddress(order)}</strong></span></div>
+          <a href={order.deliveryPhone ? `tel:${order.deliveryPhone.replace(/[^\d+]/g, "")}` : undefined}>
+            <PhoneCall size={16} /><span><small>Customer phone</small><strong>{order.deliveryPhone || "Not provided"}</strong></span>
+          </a>
+        </div>
+      )}
 
 
       <div className="payment-total">
@@ -3109,6 +3381,7 @@ const KitchenCard = memo(function KitchenCard({
         <div>
 
           <span className="order-number">
+            <Sparkles size={14} />
             KITCHEN #{order.displayId || order.id}
           </span>
 
